@@ -81,6 +81,19 @@ CREATE TABLE IF NOT EXISTS compatibility_rules (
     CHECK (source_a < source_b)
 );
 
+-- 祖先来源最低留存份额（“留存锁定”）：每个 (容器, 祖先初始样品) 一行，
+-- minimum 为该来源在此容器中必须保留的最低绝对体积（Decimal 定点字符串）。
+-- 由 PUT /containers/{id}/retention/{source_id} 单条设置 / 解除（null 删行）；
+-- 批量提交与预演在顺序模拟的每一步定点分摊后检查**源容器**的全部留存份额，
+-- 损耗核销按实际来源扣减后检查同一约束——任一份额低于下限即整批拒绝
+-- （422 retention_below_minimum），即使同批后续步骤会转回也一样。
+CREATE TABLE IF NOT EXISTS retention_rules (
+    container_id TEXT NOT NULL,
+    source_id    TEXT NOT NULL,
+    minimum      TEXT NOT NULL,
+    PRIMARY KEY (container_id, source_id)
+);
+
 -- 样品损耗核销记录（只追加）：每次成功核销在组件扣减 / version+1 /
 -- transfer_revision+1 所在的同一事务内追加 loss_records 一行 +
 -- loss_record_sources 各来源扣减明细行；两表由 BEFORE UPDATE/DELETE
@@ -92,12 +105,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """对已有数据库做幂等升级（旧库没有 containers.version / capacity /
     is_sample 列）。
 
-    ``idempotency_keys``、``compatibility_rules``、``transfer_revision``
-    与审计链相关的表（``audit_records``、``audit_record_containers``）由
-    建表脚本中的 ``CREATE TABLE IF NOT EXISTS`` 负责补齐，旧库升级时自动
-    创建，无需手工迁移；只追加审计触发器在此幂等安装。损耗核销表
-    （``loss_records``、``loss_record_sources``）同样由建表脚本补齐，
-    其只追加触发器在此幂等安装。
+    ``idempotency_keys``、``compatibility_rules``、``transfer_revision``、
+    ``retention_rules`` 与审计链相关的表（``audit_records``、
+    ``audit_record_containers``）由建表脚本中的 ``CREATE TABLE IF NOT EXISTS``
+    负责补齐，旧库升级时自动创建，无需手工迁移；只追加审计触发器在此幂等
+    安装。损耗核销表（``loss_records``、``loss_record_sources``）同样由建表
+    脚本补齐，其只追加触发器在此幂等安装。
 
     旧库 ``components`` 上的单列索引 ``idx_components_source`` 由建表脚本
     换成两个覆盖索引（``idx_components_source_container`` 支撑按来源反向

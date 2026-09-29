@@ -27,6 +27,9 @@ from .schemas import (
     LossIn,
     LossListOut,
     LossRecordedOut,
+    RetentionIn,
+    RetentionListOut,
+    RetentionResultOut,
     SampleIn,
     SampleOut,
     SourceContainersOut,
@@ -70,8 +73,14 @@ app = FastAPI(
         "严格等于总损耗且不产生负数；组件扣减、version+1、transfer_revision+1 与"
         "只追加损耗记录（触发器禁止 UPDATE/DELETE）在单个事务内完成，"
         "GET /containers/{id}/losses 按新到旧返回记录；版本冲突或校验失败整体回滚。"
+        "PUT /containers/{id}/retention/{source_id} 可为容器锁定某个祖先初始样品的"
+        "最低留存份额（null 解除）：来源须已登记，正值不得超过该来源当前份额，"
+        "版本过期或输入非法时不变更；每次实际变更使容器 version 加一但不改变"
+        "transfer_revision。批量转移与预演在每一步定点分摊后检查源容器各留存份额，"
+        "任一步低于下限即整批拒绝（即使后续会转回）；损耗核销按实际来源扣减执行"
+        "同一约束；拒绝时份额、版本、修订号与记录均不变。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -138,6 +147,40 @@ def set_container_capacity(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict:
     return service.set_container_capacity(conn, container_id, body.capacity)
+
+
+@app.put(
+    "/containers/{container_id}/retention/{source_id}",
+    response_model=RetentionResultOut,
+    tags=["retention"],
+    summary="为容器的某个祖先来源锁定 / 解除最低留存份额（实际变更时 version +1）",
+)
+def set_container_retention(
+    container_id: str,
+    source_id: str,
+    body: RetentionIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    return service.set_container_retention(
+        conn,
+        container_id,
+        source_id.strip(),
+        body.minimum,
+        body.expected_version,
+    )
+
+
+@app.get(
+    "/containers/{container_id}/retention",
+    response_model=RetentionListOut,
+    tags=["retention"],
+    summary="查询容器当前全部最低留存份额规则（含各来源当前份额）",
+)
+def get_container_retention(
+    container_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    return service.get_container_retention(conn, container_id)
 
 
 @app.post(

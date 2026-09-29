@@ -240,3 +240,18 @@ def test_zero_volume_transfer_rejected(client):
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "invalid_volume"
     assert volume_of(client, "S1") == "10.000000000"
+
+
+def test_openapi_schema_generates_and_documents_retention_api(client):
+    # 守卫：app.description 等元数据必须为合法字符串，OpenAPI 文档应能正常生成
+    r = client.get("/openapi.json")
+    assert r.status_code == 200, r.text
+    schema = r.json()
+    assert isinstance(schema["info"]["description"], str)
+    # 留存份额两个端点都已登记
+    put_path = "/containers/{container_id}/retention/{source_id}"
+    get_path = "/containers/{container_id}/retention"
+    assert "put" in schema["paths"][put_path]
+    assert "get" in schema["paths"][get_path]
+    # /docs 交互文档可访问
+    assert client.get("/docs").status_code == 200

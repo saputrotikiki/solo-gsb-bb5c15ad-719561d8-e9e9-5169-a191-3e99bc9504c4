@@ -55,6 +55,87 @@ class CapacityIn(BaseModel):
     )
 
 
+class RetentionIn(BaseModel):
+    """PUT /containers/{id}/retention/{source_id} 的请求体：设置 / 解除最低留存份额。"""
+
+    minimum: DecimalStr | None = Field(
+        ...,
+        description=(
+            "该祖先来源在此容器中必须保留的最低绝对体积：正数（小数位受 "
+            "DECIMAL_SCALE 限制）表示锁定且不得超过该来源当前份额；"
+            "null 表示解除该条规则（原本不存在亦视为成功、无变更）。"
+            "字段必须显式提供（数值或 null）。"
+        ),
+    )
+    expected_version: int = Field(
+        ...,
+        description=(
+            "客户端预期的容器 version（取自 GET /containers/{id}）；"
+            "与当前版本不符返回 409 stale_container，规则不变更"
+        ),
+    )
+
+    @field_validator("expected_version", mode="before")
+    @classmethod
+    def _reject_bool_version(cls, v):
+        # 在 lax 强转（bool -> int）发生前拦截布尔值
+        if isinstance(v, bool):
+            raise ValueError("expected_version 必须是非负整数，不能为布尔值")
+        return v
+
+    @field_validator("expected_version")
+    @classmethod
+    def _non_negative_version(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("expected_version 不能为负")
+        return v
+
+
+class RetentionRuleOut(BaseModel):
+    """一条当前生效的最低留存规则。"""
+
+    source_id: str = Field(..., description="祖先初始样品 ID")
+    minimum: DecimalStr = Field(..., description="锁定的最低绝对体积")
+    current_amount: DecimalStr = Field(
+        ...,
+        description=(
+            "该来源在此容器中的当前份额（定点字符串，便于客户端核对下限）；"
+            "当前份额为 0 时为 \"0\"（不回溯处罚既有状态）"
+        ),
+    )
+
+
+class RetentionListOut(BaseModel):
+    container_id: str
+    version: int = Field(..., description="容器当前 version")
+    rules: list[RetentionRuleOut] = Field(
+        ..., description="当前生效的全部留存规则，按 source_id 排序"
+    )
+
+
+class RetentionResultOut(BaseModel):
+    """PUT 最低留存规则的响应：当前规则与（可能递增后的）新版本。"""
+
+    container_id: str
+    source_id: str
+    version: int = Field(
+        ...,
+        description=(
+            "设置 / 解除成功后的容器 version：发生实际变更时恰好 +1，"
+            "无实际变更（设为相同值、解除不存在的规则）时保持不变"
+        ),
+    )
+    changed: bool = Field(
+        ..., description="本次调用是否实际改变了规则（true 时 version 恰好 +1）"
+    )
+    minimum: DecimalStr | None = Field(
+        ..., description="该来源当前生效的最低留存；null 表示当前无规则（已解除）"
+    )
+    rules: list[RetentionRuleOut] = Field(
+        ..., description="设置后该容器的全部留存规则，按 source_id 排序"
+    )
+
+
 class CompatibilityRuleIn(BaseModel):
     """一条祖先来源不相容规则（无向禁配对）：两端均为初始样品 ID，顺序无关。"""
 
