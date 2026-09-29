@@ -85,6 +85,75 @@ class CompatibilityRuleOut(BaseModel):
     source_b: str = Field(..., description="规范化后字典序较大的一端")
 
 
+# --------------------------------------------------------------------------- #
+# 最低留存份额（PUT/GET /containers/{id}/retention）
+# --------------------------------------------------------------------------- #
+class RetentionIn(BaseModel):
+    """PUT /containers/{id}/retention 的请求体：为某祖先初始样品锁定/解除最低留存。"""
+
+    source_id: str = Field(
+        ..., min_length=1, description="祖先初始样品 ID（必须已由 POST /samples 登记）"
+    )
+    min_volume: DecimalStr | None = Field(
+        ...,
+        description=(
+            "最低留存体积：必须为正数、小数位受 DECIMAL_SCALE 限制，且不得超过"
+            "该来源在容器中的当前份额；显式传 null 表示解除该来源的留存规则。"
+        ),
+    )
+    expected_version: int = Field(
+        ...,
+        description=(
+            "客户端预期的容器 version（取自 GET /containers/{id}）；"
+            "与当前版本不符返回 409 stale_container，规则与版本均不变"
+        ),
+    )
+
+    @field_validator("source_id")
+    @classmethod
+    def _id(cls, v: str) -> str:
+        return _check_id(v)
+
+    @field_validator("expected_version", mode="before")
+    @classmethod
+    def _reject_bool_version(cls, v):
+        # 在 lax 强转（bool -> int）发生前拦截布尔值
+        if isinstance(v, bool):
+            raise ValueError("expected_version 必须是非负整数，不能为布尔值")
+        return v
+
+    @field_validator("expected_version")
+    @classmethod
+    def _non_negative_version(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("expected_version 不能为负")
+        return v
+
+
+class RetentionRuleOut(BaseModel):
+    """一条最低留存规则及其来源当前份额。"""
+
+    source_id: str = Field(..., description="祖先初始样品 ID")
+    min_volume: DecimalStr = Field(..., description="最低留存体积（正数）")
+    current_share: DecimalStr = Field(
+        ..., description="该来源当前在容器中的绝对份额（已无份额时为 0）"
+    )
+
+
+class RetentionOut(BaseModel):
+    container_id: str
+    version: int = Field(
+        ...,
+        description=(
+            "容器当前版本：仅在实际变更（新增/改值/解除存在的规则）时加 1；"
+            "幂等重写同值或解除不存在的规则时版本不变"
+        ),
+    )
+    retention: list[RetentionRuleOut] = Field(
+        ..., description="该容器当前的全部留存规则，按 source_id 字典序排序"
+    )
+
+
 class CompatibilityRulesOut(BaseModel):
     rules: list[CompatibilityRuleOut] = Field(
         ...,

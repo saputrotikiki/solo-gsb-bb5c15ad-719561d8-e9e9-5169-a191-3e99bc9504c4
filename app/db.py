@@ -14,6 +14,7 @@ from typing import Iterator
 from .audit import AUDIT_SCHEMA_SQL, install_audit_triggers
 from .config import settings
 from .loss import LOSS_SCHEMA_SQL, install_loss_triggers
+from .retention import RETENTION_SCHEMA_SQL
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS containers (
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS compatibility_rules (
 -- transfer_revision+1 所在的同一事务内追加 loss_records 一行 +
 -- loss_record_sources 各来源扣减明细行；两表由 BEFORE UPDATE/DELETE
 -- 触发器禁止修改与删除（见 app/loss.py）。
-""" + AUDIT_SCHEMA_SQL + LOSS_SCHEMA_SQL
+""" + AUDIT_SCHEMA_SQL + LOSS_SCHEMA_SQL + RETENTION_SCHEMA_SQL
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -97,7 +98,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     建表脚本中的 ``CREATE TABLE IF NOT EXISTS`` 负责补齐，旧库升级时自动
     创建，无需手工迁移；只追加审计触发器在此幂等安装。损耗核销表
     （``loss_records``、``loss_record_sources``）同样由建表脚本补齐，
-    其只追加触发器在此幂等安装。
+    其只追加触发器在此幂等安装。最低留存份额表（``retention_locks``）
+    也由建表脚本幂等补齐，旧库初始为空（不限制任何来源）。
 
     旧库 ``components`` 上的单列索引 ``idx_components_source`` 由建表脚本
     换成两个覆盖索引（``idx_components_source_container`` 支撑按来源反向

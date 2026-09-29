@@ -48,6 +48,14 @@
   **只追加损耗记录**（`GET /containers/{id}/losses` 按新到旧返回）；实测值必须
   介于 0 与当前体积之间，版本冲突或任一校验失败整体回滚，组件、版本、修订号与
   记录均不变。
+- **最低留存份额锁定**（`PUT/GET /containers/{id}/retention`）：可为某个容器
+  锁定某祖先初始样品的**最低留存体积**（`null` 解除；正值必须不超过该来源当前
+  份额，来源须已登记为初始样品，并带容器 `expected_version`）。每次**实际变更**
+  使该容器 `version` +1，但**不**改变全局 `transfer_revision`；版本过期或输入
+  非法时规则、版本都不变。批量转移提交与预演在顺序模拟的**每一步按既有定点
+  分摊后**检查**源容器**各留存份额，任一步低于下限即 422 `retention_breach`
+  **整批拒绝**（即使同批后续会转回也一样）；损耗核销按其**实际来源扣减**执行
+  同一约束；拒绝时份额、`version`、修订号与记录均不变。
 
 ---
 
@@ -125,7 +133,11 @@ SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中
   核销前后版本、备注）与 `loss_record_sources`（各来源扣减明细）及按容器的
   反查索引，并幂等安装 4 个**只追加触发器**（两表各一个 `BEFORE UPDATE` /
   `BEFORE DELETE`，命中即 `RAISE`）；历史容器没有任何损耗记录，从首次成功
-  核销开始追加。
+  核销开始追加；
+- 旧库缺少最低留存份额表时自动创建 `retention_locks`
+  （`container_id` / `source_id` 主键、`min_volume`）及按容器的覆盖索引，
+  初始为空（不限制任何来源）；留存规则是普通可变数据（非只追加），可随时
+  修改 / 解除。
 
 升级步骤（保留数据）：
 
@@ -145,7 +157,8 @@ print([r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='tabl
 print([r[1] for r in c.execute('PRAGMA table_info(containers)')])
 "
 # 应包含 idempotency_keys、audit_records、audit_record_containers、
-# compatibility_rules、transfer_revision、loss_records、loss_record_sources 表，
+# compatibility_rules、transfer_revision、loss_records、loss_record_sources、
+# retention_locks 表，
 # containers 列中应包含 version、capacity 与 is_sample；另应存在 4 个 audit_*
 # 触发器、4 个 loss_record* 触发器与
 # idx_components_source_container / idx_components_container_source 覆盖索引
@@ -222,6 +235,17 @@ docker compose down -v       # 同时删除数据卷
   `loss_volume`。两表均有 `BEFORE UPDATE` / `BEFORE DELETE` 触发器，任何应用
   连接都无法修改或删除既有行；应用只做 INSERT，不提供修改 / 删除接口。
   版本冲突或校验失败的核销整批回滚，不产生记录。
+- 表 **`retention_locks`** 保存容器对祖先初始样品的**最低留存份额**
+  （`PUT/GET /containers/{id}/retention`）：每行一个
+  `(container_id, source_id)` → `min_volume`（Decimal 定点字符串，始终为正，
+  设置时不超过该来源当前份额），按 `source_id` 排序返回。这是**普通可变表**
+  （非只追加）：可设置、改值或解除（`null`）。仅在**实际变更**（新增 / 改成
+  不同值 / 解除一条存在的规则）时把该容器 `version` +1；幂等重写同值、解除
+  不存在的规则不递增版本。留存变更**不**递增 `transfer_revision`、不产生
+  审计记录。批量提交 / 预演在每一步定点分摊后检查**源容器**的全部留存规则，
+  损耗核销在按实际来源扣减后复用同一检查；任一来源剩余份额**严格小于**下限
+  即 422 `retention_breach`（等于下限合法）。服务启动时自动为旧库建表，
+  初始为空。
 - 表 **`components`** 上有两个覆盖索引：
   **`idx_components_source_container(source_id, container_id, amount)`**
   支撑祖先来源反向追踪（按 `source_id` 一次有序范围扫描即可取到仍含该来源的
@@ -491,6 +515,7 @@ curl -X POST http://localhost:8000/transfers/batch \
 | 转移体积大于源容器当前体积 | 422 | `insufficient_volume` |
 | 目标当前体积 + 转入量超过其容量上限 | 422 | `capacity_exceeded` |
 | 目标分摊后的非零祖先集合命中不相容禁配对 | 422 | `incompatible_sources` |
+| 源容器分摊后某来源份额低于其最低留存下限 | 422 | `retention_breach` |
 | 体积为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
 | `expected_versions` 未恰好覆盖本批全部源/目标（含空对象） | 422 | `invalid_expected_versions` |
 | `expected_versions` 中某容器版本与当前版本不符 | 409 | `stale_container` |
@@ -568,6 +593,7 @@ curl -X POST http://localhost:8000/transfers/batch \
 覆盖错误同样返回 `422 invalid_expected_versions`、版本不符同样返回
 `409 stale_container`，目标容量超限同样返回 `422 capacity_exceeded`（含 `details`），
 命中不相容禁配对同样返回 `422 incompatible_sources`（含 `details`），
+源容器分摊后跌破最低留存下限同样返回 `422 retention_breach`（含 `details`），
 HTTP 状态码、`error.code` 以及消息中的条目序号（“第 N 条转移”）
 均与 `/transfers/batch` 完全一致。预演**只读不写、不递增版本**，成功或失败都不会改变
 数据库，可以安全地重复调用；因此可用于“先核对预期版本、确认提交后版本，再正式提交”。
@@ -809,10 +835,113 @@ curl http://localhost:8000/containers/V1/losses
 | 容器不存在 | 404 | `unknown_container` |
 | `expected_version` 与当前版本不符 | 409 | `stale_container` |
 | 实测体积大于当前体积 | 422 | `measured_exceeds_volume` |
+| 按实际来源扣减后某来源跌破其最低留存下限 | 422 | `retention_breach` |
 | 实测体积为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
 
 `measured_exceeds_volume` 的 `details` 含 `container_id` / `measured_volume` /
 `current_volume`（定点字符串），便于客户端直接定位与展示。
+
+核销还会执行与批量转移相同的**最低留存份额**约束（见下一节）：按实际来源
+扣减后任一被锁定来源的剩余份额低于下限，返回 `422 retention_breach`。
+
+---
+
+## 最低留存份额锁定（容器 × 祖先初始样品）
+
+实验室需要保证某个**祖先初始样品**在容器中始终留下不少于一定体积的份额。
+留存规则是 `(容器, 来源) → 最低留存体积` 的可变映射，用
+`PUT /containers/{id}/retention` 按来源逐条设置 / 修改 / 解除：
+
+```bash
+# 接前文：V1 当前 100（S1=40 / S2=60），version=1；锁定 S1 至少留存 30
+curl -X PUT http://localhost:8000/containers/V1/retention \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"S1","min_volume":"30","expected_version":1}'
+# 200 -> {"container_id":"V1","version":2,"retention":[
+#   {"source_id":"S1","min_volume":"30.000000000","current_share":"40.000000000"}]}
+
+# 查询容器当前的全部留存规则（按 source_id 排序，含各来源当前份额）
+curl http://localhost:8000/containers/V1/retention
+# 200 -> {"container_id":"V1","version":2,"retention":[...]}
+
+# 解除：min_volume 显式传 null（V1 当前 version=2）
+curl -X PUT http://localhost:8000/containers/V1/retention \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"S1","min_volume":null,"expected_version":2}'
+# 200 -> {"container_id":"V1","version":3,"retention":[]}
+```
+
+请求体字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_id` | 必填。祖先初始样品 ID，必须已由 `POST /samples` 登记（未知 ID / 空容器返回 `422 unknown_sample`） |
+| `min_volume` | 必填。正数（小数位受 `DECIMAL_SCALE` 限制）设置 / 修改下限，且**不得超过该来源当前在容器中的份额**；显式 `null` 表示**解除**该来源的规则。`0` 不是合法下限（请用 `null` 解除），返回 `422 invalid_volume` |
+| `expected_version` | 必填。客户端预期的容器 `version`（取自 `GET /containers/{id}`）；与当前版本不符返回 `409 stale_container`，规则与版本均不变 |
+
+行为约定：
+
+- **实际变更才递增版本**：新增规则、把规则改成**不同的值**、解除一条**存在**
+  的规则都会使容器 `version` +1；幂等重写同一个值（如 `"30"` 与 `"30.0"`）、
+  解除一条本就不存在的规则**不是**实际变更，版本保持不变。响应中的 `version`
+  始终是操作完成后的（即新版本或当前版本），因此可以直接作为下一次操作的
+  `expected_version`；
+- **不触碰转移修订号 / 审计**：留存规则变更**不**递增全局
+  `transfer_revision`（来源反查翻页游标不会因此失效），也不产生审计记录；
+- **回显当前份额**：响应与 `GET` 中每条规则都带 `current_share`（该来源当前在
+  容器中的绝对份额，容器中已无该来源份额时为 `"0.000000000"`）；从未设置过
+  规则的容器返回空列表，容器不存在返回 `404 unknown_container`；
+- 下限设置成功后，该来源在容器中的份额一定 `≥ min_volume > 0`（设置时刻已
+  校验，后续取走 / 核销又被下方约束拦住），因此规则不会“悬空”在 0 份额上。
+
+设置规则失败的情形：
+
+| 情形 | 状态码 | `error.code` |
+| --- | --- | --- |
+| 容器不存在 | 404 | `unknown_container` |
+| 来源未登记为初始样品（未知 ID 或空容器） | 422 | `unknown_sample` |
+| `min_volume` 为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
+| 正值超过该来源当前份额（含容器当前不含该来源） | 422 | `retention_exceeds_share` |
+| `expected_version` 与当前版本不符 | 409 | `stale_container` |
+
+`retention_exceeds_share` 的 `details` 含 `container_id` / `source_id` /
+`min_volume` / `current_share`。任何失败都整体回滚：规则、容器 `version` 与
+`transfer_revision` 均不变。
+
+### 留存约束（批量转移 / 预演 / 损耗核销）
+
+规则生效后，取走份额的两条路径都执行**同一条**检查——
+`POST /transfers/batch` 与 `POST /transfers/preview` 在顺序模拟的**每一步按既有
+定点分摊之后**，检查**源容器**的全部留存规则：
+
+```bash
+# V1(S1=40/S2=60) 锁 S1 留存 30；转出 26：S1 按 40% 被扣 10.4，剩 29.6 < 30
+curl -X POST http://localhost:8000/transfers/batch -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"V1","destination":"V2","volume":"26"}]}'
+# 422 -> {"error":{"code":"retention_breach",
+#   "message":"第 1 条转移使源容器 'V1' 中来源 'S1' 的留存份额 29.600000000 低于最低留存下限 30.000000000，整批拒绝",
+#   "details":{"index":1,"source":"V1","container_id":"V1","source_id":"S1",
+#              "remaining":"29.600000000","min_volume":"30.000000000"}}}
+```
+
+- **分摊后检查、严格小于才算违规**：用该步**最大余额法实际扣取**后的源容器
+  份额与下限比较；剩余份额**恰好等于**下限合法，**严格小于**下限才拒绝。
+  `details` 给出条目序号 `index`、源容器 `source` / `container_id`、来源
+  `source_id`、分摊后剩余 `remaining` 与下限 `min_volume`（定点字符串）；
+- **逐步检查、后续转回也不救**：任一步先跌破即整批拒绝，即使同批后续转移会
+  把该来源份额转回源容器也一样（消息中的 `index` 是第一条跌破的步骤）；
+- **只约束取走、不约束转入**：向容器转入只会增加份额，目标容器的留存规则不
+  参与检查；隐性祖先随混合传播后，从混合容器取走时同样按其留存规则检查；
+- **损耗核销同约束**：`POST /containers/{id}/losses` 在按实际来源扣减后检查
+  同一容器的全部留存规则，违反即 `422 retention_breach`（`details` 含
+  `container_id` / `source_id` / `remaining` / `min_volume`，无 `index`），
+  整体回滚；零损耗核销不改变份额，天然通过；
+- **失败不留痕**：留存约束拒绝与容量 / 不相容 / 源液不足等失败完全一致——
+  份额、容器 `version`、`transfer_revision`、幂等记录、审计链与损耗记录都
+  不变；预演只读不写。**已成功请求的幂等重放直接返回首次结果**，不会用新设置
+  的留存规则重新校验（与容量上限、不相容规则的重放语义一致）；
+- 预演与真实提交共用同一套检查，错误码、HTTP 状态码与 `details` 完全一致，
+  可先预演确认“不会跌破留存下限”再正式提交。
 
 ---
 
@@ -1009,16 +1138,17 @@ pytest -q
 app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接（含只读连接）、建库（启动时执行，含审计表、规则表、
-                #   transfer_revision、损耗记录表、覆盖索引与只追加触发器迁移）
+                #   transfer_revision、损耗记录表、留存份额表、覆盖索引与只追加触发器迁移）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
-  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、容量/不相容校验、查询、
-                #   祖先来源反向追踪与游标分页、样品损耗核销事务
+  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、容量/不相容/最低留存校验、
+                #   查询、祖先来源反向追踪与游标分页、样品损耗核销事务、留存规则事务
   audit.py      # 只追加审计链：载荷规范化、哈希、同事务追加、查询、链校验
   loss.py       # 只追加损耗核销记录：建表、触发器、同事务追加、按容器查询（新到旧）
+  retention.py  # 最低留存份额：建表、规则读写与响应组装（校验/版本/事务在 service.py）
   main.py       # FastAPI 路由与错误处理（含 /compatibility/rules、/sources/*、
-                #   /audit/*、/containers/{id}/losses）
+                #   /audit/*、/containers/{id}/losses、/containers/{id}/retention）
 tests/          # pytest 端到端、分摊算法、幂等、容量、不相容规则、反向追踪、
-                #   审计链与损耗核销测试
+                #   审计链、损耗核销与最低留存份额测试
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh

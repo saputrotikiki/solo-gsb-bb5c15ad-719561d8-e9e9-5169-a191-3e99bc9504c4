@@ -28,6 +28,17 @@
   排序后的全部冲突对）。同批前序混合产生的隐性祖先随模拟状态自然参与后续
   步骤的检查。规则只约束其后的转移，不回溯既有容器；规则变更本身不是批量
   转移（不递增 version、不产生审计记录）。
+* 可为容器登记针对某祖先初始样品的**最低留存份额**（``retention_locks`` 表，
+  见 :func:`set_container_retention` / :func:`get_container_retention`，
+  ``PUT/GET /containers/{id}/retention``）：``min_volume`` 为正数时必须不超过
+  该来源在容器中的当前份额，``None``（请求传 null）表示解除；来源必须已登记
+  为初始样品。每次**实际变更**（新增 / 改成不同值 / 解除一条存在的规则）使
+  容器 ``version`` +1（幂等重写同值、解除不存在的规则不是实际变更，版本不变），
+  但**不**触碰全局 ``transfer_revision``、不产生审计记录；版本过期
+  （409 stale_container）或输入非法时规则与版本均不变。批量提交 / 预演在顺序
+  模拟的每一步**定点分摊后**检查**源容器**各留存份额，剩余低于下限即整批拒绝
+  （422 retention_breach，``details`` 含条目序号、源容器、来源、剩余与下限）；
+  损耗核销（:func:`record_container_loss`）按实际来源扣减后执行同一约束。
 * 预演（preview）与真实提交共享同一份校验与分摊实现（见
   :func:`_simulate_transfers`），错误码与条目序号完全一致；
   预演只读不写（不递增 version），无论成功失败都不改变数据库，但返回中给出
@@ -304,6 +315,133 @@ def set_container_capacity(
 
 
 # --------------------------------------------------------------------------- #
+# 最低留存份额：PUT/GET /containers/{id}/retention
+# --------------------------------------------------------------------------- #
+def set_container_retention(
+    conn: sqlite3.Connection,
+    cid: str,
+    source_id: str,
+    raw_min_volume: Decimal | None,
+    expected_version: int,
+) -> dict:
+    """为容器锁定（或解除）某祖先初始样品的最低留存份额。
+
+    * ``raw_min_volume`` 为正数（有限、小数位受 ``DECIMAL_SCALE`` 限制、> 0）
+      时设置 / 修改下限，且必须**不超过**该来源在容器中的当前份额（来源在
+      容器中份额为 0 视为超过）；``None`` 表示解除该来源的留存规则；
+    * ``source_id`` 必须已登记为**初始样品**：未知 ID 或空容器返回
+      422 ``unknown_sample``；容器不存在返回 404 ``unknown_container``；
+    * ``expected_version`` 必须等于容器当前版本，否则返回
+      409 ``stale_container``，规则与版本均不变；
+    * 仅在**实际变更**时（新增规则 / 改成不同的值 / 解除一条存在的规则）
+      把容器 ``version`` +1；幂等重写同一值、解除不存在的规则不是实际变更，
+      版本保持不变。留存变更**不**递增 ``transfer_revision``、不产生审计记录。
+
+    返回容器当前的全部留存规则（每条含下限与该来源当前份额）与结果版本，
+    格式与 :func:`get_container_retention` 一致。
+    """
+    # 纯参数校验在事务外完成（与数据库状态无关）：null 表示解除，非 null 必须
+    # 是非负有限且精度合法的体积，且严格大于 0（0 用 null 解除）
+    min_volume: Decimal | None = None
+    if raw_min_volume is not None:
+        min_volume = parse_volume(raw_min_volume, "min_volume")
+        if min_volume == 0:
+            raise LineageError(
+                422,
+                "invalid_volume",
+                "min_volume 必须大于 0（解除留存规则请传 null）",
+            )
+
+    # IMMEDIATE：存在性 / 已登记 / 版本 / 份额上限校验与写入在同一写事务原子完成
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        loaded = _load_state(conn, cid)
+        if loaded is None:
+            raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
+        state, version, _capacity = loaded
+
+        if version != expected_version:
+            raise LineageError(
+                409,
+                "stale_container",
+                (
+                    f"容器 '{cid}' 版本已过期：expected_version={expected_version}，"
+                    f"当前 version={version}，留存规则未变更"
+                ),
+            )
+
+        sample_row = conn.execute(
+            "SELECT 1 FROM containers WHERE id = ? AND is_sample = 1", (source_id,)
+        ).fetchone()
+        if sample_row is None:
+            raise LineageError(
+                422,
+                "unknown_sample",
+                f"来源 '{source_id}' 尚未登记为初始样品，留存规则未设置",
+                details={"source_id": source_id, "unknown_samples": [source_id]},
+            )
+
+        from . import retention as retention_module
+
+        changed = False
+        if min_volume is None:
+            # 解除：仅当规则存在时才是实际变更（DELETE 本身幂等）
+            if retention_module.get_lock(conn, cid, source_id) is not None:
+                retention_module.delete_lock(conn, cid, source_id)
+                changed = True
+        else:
+            current_share = state.get(source_id, Decimal(0).quantize(VOLUME_QUANTUM))
+            if min_volume > current_share:
+                raise LineageError(
+                    422,
+                    "retention_exceeds_share",
+                    (
+                        f"容器 '{cid}' 中来源 '{source_id}' 当前份额为 {current_share}，"
+                        f"最低留存下限 {min_volume} 超过当前份额，留存规则未设置"
+                    ),
+                    details={
+                        "container_id": cid,
+                        "source_id": source_id,
+                        "min_volume": format(min_volume, "f"),
+                        "current_share": format(current_share, "f"),
+                    },
+                )
+            if retention_module.get_lock(conn, cid, source_id) != min_volume:
+                retention_module.upsert_lock(conn, cid, source_id, min_volume)
+                changed = True
+
+        next_version = version + 1 if changed else version
+        if changed:
+            conn.execute(
+                "UPDATE containers SET version = ? WHERE id = ?",
+                (next_version, cid),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return retention_module.format_retention(conn, cid, next_version, state)
+
+
+def get_container_retention(conn: sqlite3.Connection, cid: str) -> dict:
+    """返回容器当前的全部最低留存规则（按 source_id 排序）与当前版本。
+
+    每条规则给出 ``source_id``、``min_volume`` 与该来源当前份额
+    ``current_share``（容器中已无该来源份额时为 0）。容器不存在返回
+    404 ``unknown_container``；从未设置规则的容器返回空列表。
+    """
+    loaded = _load_state(conn, cid)
+    if loaded is None:
+        raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
+    state, version, _capacity = loaded
+
+    from . import retention as retention_module
+
+    return retention_module.format_retention(conn, cid, version, state)
+
+
+# --------------------------------------------------------------------------- #
 # 祖先来源不相容规则（无向禁配对）
 # --------------------------------------------------------------------------- #
 def _load_compatibility_rules(conn: sqlite3.Connection) -> list[tuple[str, str]]:
@@ -452,6 +590,47 @@ def _validate_expected_coverage(
         )
 
 
+def _check_retention(
+    locks: Mapping[str, Decimal],
+    state: State,
+    *,
+    step: int | None,
+    container_id: str,
+) -> None:
+    """核对容器在分摊 / 核销后的状态是否满足全部最低留存份额。
+
+    ``locks`` 为该容器登记的 ``{source_id: min_volume}``；任一来源的当前
+    份额**严格小于**其下限即抛 422 ``retention_breach``。多条同时违反时
+    按 source_id 字典序报第一条（错误码与响应结构对批量转移与损耗核销一致；
+    批量场景 ``step`` 为条目序号并带 ``source`` 字段，核销场景 ``step=None``）。
+    """
+    for sid in sorted(locks):
+        minimum = locks[sid]
+        remaining = state.get(sid, Decimal(0).quantize(VOLUME_QUANTUM))
+        if remaining < minimum:
+            details = {
+                "container_id": container_id,
+                "source_id": sid,
+                "remaining": format(remaining, "f"),
+                "min_volume": format(minimum, "f"),
+            }
+            if step is not None:
+                # 批量转移 / 预演：给出条目序号与源容器（字段命名沿用 capacity /
+                # incompatible 错误的 index / source / destination 习惯）
+                details = {"index": step, "source": container_id, **details}
+                message = (
+                    f"第 {step} 条转移使源容器 '{container_id}' 中来源 '{sid}' 的"
+                    f"留存份额 {remaining} 低于最低留存下限 {minimum}，整批拒绝"
+                )
+            else:
+                # 损耗核销：容器即核销对象，没有条目序号
+                message = (
+                    f"核销使容器 '{container_id}' 中来源 '{sid}' 的留存份额 "
+                    f"{remaining} 低于最低留存下限 {minimum}，核销拒绝且不落库"
+                )
+            raise LineageError(422, "retention_breach", message, details=details)
+
+
 def _simulate_transfers(
     conn: sqlite3.Connection,
     prepared: list[tuple[str, str, Decimal]],
@@ -477,6 +656,13 @@ def _simulate_transfers(
     422 ``capacity_exceeded``，``details`` 含条目序号、目标与预计超出量；
     同批先转出再转入按模拟到本步时的当时余量判断。
 
+    每一步分摊并应用到源 / 目标之后做**最低留存份额校验**（源容器）：
+    按本步定点分摊后的源容器状态，逐条核对该容器在 ``retention_locks`` 中
+    登记的下限——任一来源剩余份额 **低于** 下限（严格小于）即抛
+    422 ``retention_breach``，``details`` 含条目序号、源容器、来源、分摊后
+    剩余份额与下限。检查发生在内存模拟状态上，故同批前序步骤（含把份额
+    转回源容器）都已反映；但任一步先跌破即整批拒绝，“后续会转回”不予放行。
+
     每一步分摊并应用到目标之后做**祖先来源不相容校验**：目标容器此时的
     **非零祖先集合**若同时含有某一禁配对（``compatibility_rules``）的双方，
     即抛 422 ``incompatible_sources``，``details`` 含条目序号、目标容器与
@@ -494,6 +680,10 @@ def _simulate_transfers(
     taken_steps: list[dict[str, Decimal]] = []
     # 禁配规则在事务内一次读入：与状态读取同一快照，提交与预演一致
     rules = _load_compatibility_rules(conn)
+    # 全部留存下限在事务内一次读入：同一快照、同一约束集合（提交与预演一致）
+    from .retention import load_all_locks
+
+    all_locks = load_all_locks(conn)
 
     for index, (src, dst, volume) in enumerate(prepared, start=1):
         # 未知容器（初始样品与空容器都在 containers 表中）
@@ -586,6 +776,16 @@ def _simulate_transfers(
             if src_state[sid] == 0:
                 del src_state[sid]
         taken_steps.append(taken)
+
+        # 最低留存份额约束（源容器）：按本步“既有定点分摊”后的源状态逐条核对，
+        # 任一被锁定来源的剩余份额严格小于下限即整批拒绝。src_state 反映本批
+        # 前序步骤的结果，但第 index 步一旦跌破立即拒绝（即使后续步骤会转回）。
+        _check_retention(
+            all_locks.get(src, {}),
+            src_state,
+            step=index,
+            container_id=src,
+        )
 
         # 祖先来源不相容约束：目标在本步分摊后的非零祖先集合不得同时含有
         # 任一禁配对的双方。dst_state 已反映本批前序步骤的结果，故同批前序
@@ -882,6 +1082,9 @@ def record_container_loss(
 
     * 成功后容器 ``version`` 与 ``transfer_revision`` 各加 1，既有来源反查游标
       因修订号变化失效（翻页返回 409 stale_cursor）；
+    * 按实际来源扣减后执行与批量转移**同一条**最低留存份额约束
+      （``retention_locks``）：任一被锁定来源核销后份额低于下限返回
+      422 ``retention_breach``（``details`` 含容器、来源、剩余与下限）；
     * 版本冲突或任一校验失败整体回滚——组件、版本、修订号与损耗记录均不变。
 
     核销不是批量转移：不产生审计记录、不支持幂等键。返回核销结果（新 ``version``、
@@ -938,6 +1141,15 @@ def record_container_loss(
         else:
             # 实测值 == 当前体积：零损耗，不扣减任何来源（仍递增版本并写记录）
             deductions = {}
+
+        # 最低留存份额约束：核销按实际来源扣减后，与批量转移同一条规则核对。
+        # 零核销不改变任何份额，天然通过；违反即整体回滚（组件 / 版本 / 修订号 /
+        # 损耗记录均不变）。
+        from .retention import list_locks
+
+        _check_retention(
+            dict(list_locks(conn, cid)), state, step=None, container_id=cid
+        )
 
         next_version = version + 1
         _persist_states(conn, {cid: state}, {cid: next_version})
